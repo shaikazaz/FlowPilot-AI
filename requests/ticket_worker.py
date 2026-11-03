@@ -1,16 +1,46 @@
 
 import json
+import os
 import sys
+import time
 import traceback
-import urllib.request
+from pathlib import Path
 
-OLLAMA_URL = "http://localhost:11434/api/generate"
-OLLAMA_MODEL = "qwen2.5:3b"
+from dotenv import load_dotenv
+from google import genai
+from google.genai import types, errors
 
+
+# --------------------------------------------------
+# ENVIRONMENT CONFIGURATION
+# --------------------------------------------------
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+load_dotenv(PROJECT_ROOT / ".env")
+
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+
+# Primary model and fallback model
+GEMINI_MODELS = [
+    "gemini-3.1-flash-lite",
+    "gemini-2.5-flash-lite",
+]
+
+
+# --------------------------------------------------
+# TICKET GENERATION
+# --------------------------------------------------
 
 def generate_ticket(issue):
+
     if not isinstance(issue, str) or not issue.strip():
         raise ValueError("Please describe your issue.")
+
+    if not GEMINI_API_KEY:
+        raise RuntimeError("GEMINI_API_KEY is not configured.")
+
+    client = genai.Client(api_key=GEMINI_API_KEY)
 
     prompt = f"""
 You are FlowPilot AI, an intelligent business ticket assistant.
@@ -35,29 +65,69 @@ User's issue:
 {issue.strip()}
 """.strip()
 
-    payload = json.dumps({
-        "model": OLLAMA_MODEL,
-        "prompt": prompt,
-        "stream": False,
-        "format": "json",
-    }).encode("utf-8")
+    response = None
+    last_error = None
 
-    request = urllib.request.Request(
-        OLLAMA_URL,
-        data=payload,
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
+    # --------------------------------------------------
+    # GEMINI API WITH RETRIES AND FALLBACK
+    # --------------------------------------------------
 
-    with urllib.request.urlopen(request, timeout=180) as response:
-        result = json.loads(response.read().decode("utf-8"))
+    for model in GEMINI_MODELS:
 
-    model_response = result.get("response", "").strip()
+        for attempt in range(2):
 
-    if not model_response:
-        raise RuntimeError("Ollama returned an empty response.")
+            try:
+                print(
+                    f"Trying Gemini model: {model}, attempt {attempt + 1}",
+                    file=sys.stderr,
+                )
 
-    ticket = json.loads(model_response)
+                response = client.models.generate_content(
+                    model=model,
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        response_mime_type="application/json"
+                    ),
+                )
+
+                if response and response.text:
+                    break
+
+                raise RuntimeError("Gemini returned an empty response.")
+
+            except errors.ServerError as exc:
+                last_error = exc
+
+                if attempt == 0:
+                    time.sleep(3)
+                    continue
+
+                break
+
+            except errors.ClientError as exc:
+                last_error = exc
+                break
+
+            except Exception as exc:
+                last_error = exc
+                break
+
+        if response and response.text:
+            break
+
+    if not response or not response.text:
+        raise RuntimeError(
+            f"All Gemini model attempts failed: {last_error}"
+        )
+
+    # --------------------------------------------------
+    # PARSE JSON RESPONSE
+    # --------------------------------------------------
+
+    try:
+        ticket = json.loads(response.text.strip())
+    except json.JSONDecodeError as exc:
+        raise ValueError("Gemini returned invalid JSON.") from exc
 
     required_fields = {
         "title",
@@ -72,17 +142,25 @@ User's issue:
     if not required_fields.issubset(ticket.keys()):
         raise ValueError("AI response is missing ticket fields.")
 
+    # --------------------------------------------------
+    # VALIDATE PRIORITY
+    # --------------------------------------------------
+
     priority = ticket.get("priority")
 
     if not isinstance(priority, str):
-       raise ValueError("AI returned an invalid priority.")
+        raise ValueError("AI returned an invalid priority.")
 
     priority = priority.strip().capitalize()
-  
+
     if priority not in ("Low", "Medium", "High"):
-       raise ValueError("AI returned an invalid priority.")
- 
+        raise ValueError("AI returned an invalid priority.")
+
     ticket["priority"] = priority
+
+    # --------------------------------------------------
+    # VALIDATE TICKET FIELDS
+    # --------------------------------------------------
 
     if not all(
         isinstance(ticket[field], str) and ticket[field].strip()
@@ -97,17 +175,26 @@ User's issue:
     return ticket
 
 
+# --------------------------------------------------
+# COMMAND LINE EXECUTION
+# --------------------------------------------------
+
 if __name__ == "__main__":
+
     try:
         payload = json.loads(sys.stdin.read())
+
         issue = payload.get("issue", "")
 
         ticket = generate_ticket(issue)
+
         print(json.dumps(ticket, ensure_ascii=False))
 
     except Exception as exc:
+
         print(
             f"Ticket worker failed: {exc}\n{traceback.format_exc()}",
             file=sys.stderr,
         )
+
         sys.exit(1)
